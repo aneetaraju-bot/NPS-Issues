@@ -2,10 +2,9 @@ import io
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="NPS Problems – FAST v3", layout="wide")
-st.title("Monthly NPS Problems – Regional-wise (FAST v3)")
+st.set_page_config(page_title="NPS Problems – FAST v4", layout="wide")
+st.title("Monthly NPS Problems – Regional-wise (FAST v4)")
 
 # ---------- Fixed column maps (your exact headers) ----------
 JUNE_COLS = {
@@ -34,13 +33,14 @@ JULY_COLS = {
 }
 NEEDED = ["Created At","Feedback","Rating","Vertical","Courses","Region","Status","Is promoter","Is Detractor","No: of Responses"]
 
-# ---------- Cached loaders (hash on file bytes so uploads are read once) ----------
+# ---------- Cached loaders ----------
 @st.cache_data(show_spinner=False)
 def _read_csv_bytes(file_bytes: bytes, usecols):
+    # pyarrow engine is fast; make sure pyarrow is in requirements.txt
     return pd.read_csv(io.BytesIO(file_bytes), usecols=usecols, engine="pyarrow")
 
 @st.cache_data(show_spinner=False)
-def load_and_standardize_from_bytes(file_bytes: bytes, mapping: dict, month_label: str) -> pd.DataFrame:
+def load_and_standardize_from_bytes(file_bytes: bytes, mapping: dict, file_month_label: str) -> pd.DataFrame:
     df = _read_csv_bytes(file_bytes, [mapping[k] for k in mapping])
     df = df.rename(columns={v: k for k, v in mapping.items()})
     df = df[df["Vertical"].notna() & df["Courses"].notna() & df["Region"].notna()].copy()
@@ -54,29 +54,40 @@ def load_and_standardize_from_bytes(file_bytes: bytes, mapping: dict, month_labe
     for c in ["Vertical","Courses","Region","Status"]:
         df[c] = df[c].astype("category")
 
+    # FileMonth for fallback when timestamps are missing
+    df["FileMonth"] = file_month_label  # e.g., "2025-06" / "2025-07"
     for col in NEEDED:
         if col not in df.columns:
             df[col] = np.nan
 
-    df["Month"] = month_label
-    return df[NEEDED + ["Month"]]
+    # Legacy Month label for existing sections (friendly text)
+    df["Month"] = "June 2025" if file_month_label == "2025-06" else "July 2025"
+    return df[NEEDED + ["Month","FileMonth"]]
 
-# ---------- Compute all summaries ONCE (cached) ----------
-def _nps_calc(g):
-    r = g["Rating"]
+def _nps_value(group):
+    r = group["Rating"]
     total = r.notna().sum()
     if total == 0: return np.nan
     prom = ((r >= 9) & (r <= 10)).sum()
     det  = ((r >= 0) & (r <= 6)).sum()
     return ((prom/total) - (det/total)) * 100.0
 
+def _nps_stats(group):
+    r = group["Rating"].dropna()
+    total = len(r)
+    prom = ((r >= 9) & (r <= 10)).sum()
+    det  = ((r >= 0) & (r <= 6)).sum()
+    pas  = ((r >= 7) & (r <= 8)).sum()
+    nps = ((prom/total) - (det/total)) * 100.0 if total else np.nan
+    return pd.Series({"Responses": total, "Promoters": prom, "Passives": pas, "Detractors": det, "NPS": nps})
+
 @st.cache_data(show_spinner=False)
 def compute_all(june_bytes: bytes, july_bytes: bytes):
-    june = load_and_standardize_from_bytes(june_bytes, JUNE_COLS, "June 2025")
-    july = load_and_standardize_from_bytes(july_bytes, JULY_COLS, "July 2025")
+    june = load_and_standardize_from_bytes(june_bytes, JUNE_COLS, "2025-06")
+    july = load_and_standardize_from_bytes(july_bytes, JULY_COLS, "2025-07")
     combined = pd.concat([june, july], ignore_index=True)
 
-    # Problems = Detractors (precompute ONCE)
+    # ============== Existing (problems & compare using friendly Month) ==============
     problems = combined[combined["Is Detractor"] == 1].copy()
     problems_full = (
         problems.groupby(["Region","Courses","Status","Month"], dropna=False)
@@ -86,7 +97,6 @@ def compute_all(june_bytes: bytes, july_bytes: bytes):
             Example_Comments=("Feedback", lambda x: "; ".join(x.dropna().astype(str).head(3)))
         ).reset_index()
     )
-
     compare_full = (
         problems_full.pivot(index=["Region","Courses","Status"], columns="Month", values="Detractor_Count")
         .fillna(0).reset_index()
@@ -97,17 +107,30 @@ def compute_all(june_bytes: bytes, july_bytes: bytes):
 
     nps_full = (
         combined.groupby(["Region","Courses","Status","Month"], dropna=False)
-        .apply(_nps_calc).reset_index(name="NPS")
+        .apply(_nps_value).reset_index(name="NPS")
     )
+
+    # ============== New: Consecutive months via timestamp ("YYYY-MM") ==============
+    month_ts = combined["Created At"].dt.to_period("M").astype(str)
+    month_ts = month_ts.replace("NaT", pd.NA)
+    combined["Month_TS"] = month_ts.fillna(combined["FileMonth"])
+
+    overall_consec = (combined.groupby("Month_TS").apply(_nps_stats).reset_index().rename(columns={"Month_TS":"Month"}).sort_values("Month"))
+    region_consec  = (combined.groupby(["Region","Month_TS"]).apply(_nps_stats).reset_index().rename(columns={"Month_TS":"Month"}).sort_values(["Region","Month"]))
+    rcs_consec     = (combined.groupby(["Region","Courses","Status","Month_TS"]).apply(_nps_stats).reset_index().rename(columns={"Month_TS":"Month"}).sort_values(["Region","Courses","Status","Month"]))
 
     # Unique values for filters
     regions = ["All"] + sorted(combined["Region"].dropna().astype(str).unique())
     courses = ["All"] + sorted(combined["Courses"].dropna().astype(str).unique())
     statuses = ["All"] + sorted(combined["Status"].dropna().astype(str).unique())
 
-    return problems_full, compare_full, nps_full, regions, courses, statuses
+    return (
+        problems_full, compare_full, nps_full,
+        overall_consec, region_consec, rcs_consec,
+        regions, courses, statuses
+    )
 
-# ---------- UI: upload & precompute (once) ----------
+# ---------- UI: upload & precompute ----------
 c1, c2 = st.columns(2)
 with c1:
     june_file = st.file_uploader("Upload **June** CSV", type=["csv"])
@@ -120,9 +143,13 @@ if not june_file or not july_file:
     st.info("Upload both files to continue.")
     st.stop()
 
-problems_full, compare_full, nps_full, regions, courses, statuses = compute_all(june_file.getvalue(), july_file.getvalue())
+(
+    problems_full, compare_full, nps_full,
+    overall_consec, region_consec, rcs_consec,
+    regions, courses, statuses
+) = compute_all(june_file.getvalue(), july_file.getvalue())
 
-# ---------- Filters (ONLY filter precomputed tables – instant) ----------
+# ---------- Filters (slice precomputed tables only) ----------
 st.subheader("Filters")
 fc1, fc2, fc3 = st.columns(3)
 with fc1:
@@ -134,16 +161,16 @@ with fc3:
 
 def _mask(df):
     m = pd.Series(True, index=df.index)
-    if f_region != "All": m &= (df["Region"].astype(str) == f_region)
-    if f_course != "All": m &= (df["Courses"].astype(str) == f_course)
-    if f_status != "All": m &= (df["Status"].astype(str) == f_status)
+    if "Region" in df.columns and f_region != "All": m &= (df["Region"].astype(str) == f_region)
+    if "Courses" in df.columns and f_course != "All": m &= (df["Courses"].astype(str) == f_course)
+    if "Status"  in df.columns and f_status  != "All": m &= (df["Status"].astype(str)  == f_status)
     return m
 
 problems_view = problems_full[_mask(problems_full)]
 compare_view  = compare_full[_mask(compare_full)]
 nps_view      = nps_full[_mask(nps_full)]
 
-# ---------- Tables ----------
+# ---------- Existing sections ----------
 st.header("Regional-wise Monthly NPS Problems (Detractors)")
 st.dataframe(problems_view.head(50) if perf_lite else problems_view, use_container_width=True)
 
@@ -152,6 +179,28 @@ st.dataframe(compare_view.head(50) if perf_lite else compare_view, use_container
 
 st.header("NPS by Month (Region/Course/Batch)")
 st.dataframe(nps_view.head(50) if perf_lite else nps_view, use_container_width=True)
+
+# ---------- New: Consecutive Months NPS ----------
+st.header("Consecutive Months NPS (derived from timestamps)")
+
+# Overall consecutive months
+st.subheader("Overall by Month")
+st.dataframe(overall_consec.head(50) if perf_lite else overall_consec, use_container_width=True)
+# quick chart
+if not perf_lite or st.button("Draw overall NPS chart"):
+    if not overall_consec.empty:
+        overall_chart = overall_consec.set_index("Month")[["NPS"]]
+        st.line_chart(overall_chart, use_container_width=True)
+
+# Region-wise consecutive months (respect region filter only)
+st.subheader("Region-wise by Month")
+reg_view = overall_consec if f_region == "All" else region_consec[region_consec["Region"].astype(str) == f_region]
+st.dataframe(reg_view.head(50) if perf_lite else reg_view, use_container_width=True)
+
+# Region–Course–Status consecutive months (respect all filters)
+st.subheader("Region–Course–Status by Month")
+rcs_view = rcs_consec[_mask(rcs_consec)]
+st.dataframe(rcs_view.head(50) if perf_lite else rcs_view, use_container_width=True)
 
 # ---------- Downloads ----------
 def _download(df, label):
@@ -165,29 +214,7 @@ with c3: _download(problems_view, "regional_monthly_nps_problems")
 with c4: _download(compare_view,  "june_vs_july_detractor_comparison")
 with c5: _download(nps_view,      "nps_by_month_region_course_batch")
 
-# ---------- Charts (on demand) ----------
-st.header("Charts")
-if not perf_lite or st.button("Draw charts now"):
-    topj = (problems_view[problems_view["Month"] == "July 2025"]
-            .sort_values("Detractor_Count", ascending=False).head(10))
-    if topj.empty:
-        st.info("No July detractors for current filter.")
-    else:
-        fig = plt.figure()
-        labels = (topj["Region"] + " | " + topj["Courses"]).astype(str).str.slice(0, 70)
-        plt.barh(labels, topj["Detractor_Count"].values)
-        plt.xlabel("Detractor Count"); plt.ylabel("Region | Course")
-        plt.gca().invert_yaxis()
-        st.pyplot(fig, use_container_width=True)
-
-    # Simple trend (uses filtered, precomputed data)
-    pv = (problems_view
-          .pivot(index=["Region","Courses","Status"], columns="Month", values="Detractor_Count")
-          .fillna(0).reset_index())
-    if not pv.empty:
-        june_val = pv.get("June 2025", pd.Series([0])).iloc[0] if "June 2025" in pv.columns else 0
-        july_val = pv.get("July 2025", pd.Series([0])).iloc[0] if "July 2025" in pv.columns else 0
-        fig2 = plt.figure(); plt.bar(["June 2025","July 2025"], [june_val, july_val])
-        plt.ylabel("Detractor Count"); st.pyplot(fig2, use_container_width=True)
-else:
-    st.info("Charts skipped in ⚡ Lite mode.")
+c6, c7, c8 = st.columns(3)
+with c6: _download(overall_consec, "consecutive_months_overall_nps")
+with c7: _download(region_consec,  "consecutive_months_region_nps")
+with c8: _download(rcs_consec,     "consecutive_months_region_course_status_nps")
