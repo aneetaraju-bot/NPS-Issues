@@ -1,191 +1,134 @@
-# app.py
 import io
-import re
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Monthly NPS Problems (Regional-wise)", layout="wide")
-
-st.title("Monthly NPS Problems – Regional-wise (Courses, Batches, Timestamps)")
-st.caption("Upload your June & July NPS CSVs. The app auto-detects feedback/rating columns even if headers are in Malayalam/Telugu.")
+st.set_page_config(page_title="NPS Problems – Fast Mode", layout="wide")
+st.title("Monthly NPS Problems – Regional-wise (FAST)")
 
 # -----------------------------
-# Helpers
+# EXACT column names in your CSVs (no detection)
 # -----------------------------
-KNOWN_COLS = {
-    "created_at": ["created at", "created_at"],
-    "vertical": ["vertical"],
-    "courses": ["courses", "course"],
-    "region": ["region"],
-    "status": ["status", "batch", "batch type"],
-    "is_promoter": ["is promoter", "promoter"],
-    "is_detractor": ["is detractor", "detractor"],
-    "num_responses": ["no: of responses", "no of responses", "responses", "count", "response count"],
+JUNE_COLS = {
+    "Created At": "Created At",
+    "Feedback": "3_Elevate കോഴ്സുകൾ കൂടുതൽ മെച്ചപ്പടുത്താൻ നിങ്ങളുടെ വിലയേറിയ അഭിപ്രായങ്ങൾ നൽകുക",
+    "Rating": "4_നിങ്ങളുടെ Elevate കോഴ്സിനെ നിങ്ങളുടെ സുഹൃത്തുക്കൾക്ക്  നിർദേശിക്കാൻ നിങ്ങൾ എത്രമാത്രം തയ്യാറാണെന്ന്  1 മുതൽ 10 വരെ ഉള്ള റേറ്റിംഗ് നൽകി ഞങ്ങളെ അറിയിക്കുക .\n(10 = തീർച്ചയായും നിർദേശിക്കും, 1 = നിർദേശിക്കില്ല)",
+    "Vertical": "Vertical",
+    "Courses": "Courses",
+    "Region": "Region",
+    "Status": "Status",
+    "Is promoter": "Is promoter",
+    "Is Detractor": "Is Detractor",
+    "No: of Responses": "No: of Responses",
 }
 
-def _best_match(col, targets):
-    c = col.strip().lower()
-    return any(t in c for t in targets)
+JULY_COLS = {
+    "Created At": "Created At",
+    "Feedback": "4_మీరు ఇచ్చే ఈ feedback మా courses ని improve చేసుకోడానికి help అవుతుంది.",
+    "Rating": "3_Elevate courses ని మీ friends కి recommend చేస్తారా? \nOut of 10, elevate కి మీరు ఎంత rating ఇస్తారు. \n(10 = most likely; 1= least likely)",
+    "Vertical": "Vertical",
+    "Courses": "Courses",
+    "Region": "Region",
+    "Status": "Status",
+    "Is promoter": "Is promoter",
+    "Is Detractor": "Is Detractor",
+    "No: of Responses": "No: of Responses",
+}
 
-def detect_created_at(df):
-    for c in df.columns:
-        if _best_match(c, KNOWN_COLS["created_at"]):
-            return c
-    # fallback: exact "Created At" if present with whitespace/newlines
-    for c in df.columns:
-        if c.replace("\n"," ").strip().lower() == "created at":
-            return c
-    return None
+NEEDED = [
+    "Created At","Feedback","Rating","Vertical","Courses","Region",
+    "Status","Is promoter","Is Detractor","No: of Responses"
+]
 
-def detect_feedback_col(df):
-    """
-    Try to find the open-text feedback column.
-    Heuristics:
-      1) Column name includes 'feedback' (any language: detect 'feedback')
-      2) Otherwise choose object/text column with longest average string length,
-         excluding known structural columns.
-    """
-    # 1) direct 'feedback' match
-    for c in df.columns:
-        if "feedback" in c.lower():
-            return c
-
-    # 2) fallback: pick a text-like column with longest avg length
-    structural_like = set()
-    for key in KNOWN_COLS:
-        structural_like |= {c for c in df.columns if _best_match(c, KNOWN_COLS[key])}
-    structural_like |= {detect_created_at(df)} if detect_created_at(df) else set()
-
-    candidates = []
-    for c in df.columns:
-        if c in structural_like:
-            continue
-        if df[c].dtype == object:
-            sample = df[c].dropna().astype(str).head(200)
-            if sample.empty: 
-                continue
-            avg_len = sample.str.len().mean()
-            candidates.append((avg_len, c))
-    if candidates:
-        candidates.sort(reverse=True)  # longest first
-        return candidates[0][1]
-    return None
-
-def detect_rating_col(df):
-    """
-    Try to find NPS rating (0-10) column even if header is in Malayalam/Telugu.
-    Heuristics:
-      1) Column name includes 'rating' (case-insensitive)
-      2) Otherwise pick a column that becomes numeric and mostly within 0..10
-    """
-    # 1) header contains 'rating'
-    for c in df.columns:
-        if "rating" in c.lower():
-            return c
-
-    # 2) numeric within 0..10
-    best = None
-    best_score = -1
-    for c in df.columns:
-        s = pd.to_numeric(df[c], errors="coerce")
-        if s.notna().sum() == 0:
-            continue
-        in_range = ((s >= 0) & (s <= 10)).sum()
-        score = in_range
-        if score > best_score and in_range >= max(5, int(0.2*len(s))):
-            best_score = score
-            best = c
-    return best
-
-def detect_by_known(df, key):
-    for c in df.columns:
-        if _best_match(c, KNOWN_COLS[key]):
-            return c
-    return None
-
-def standardize_month(df, month_label):
-    """
-    Return a standardized dataframe with columns:
-    ['Created At','Feedback','Rating','Vertical','Courses','Region','Status','Is promoter','Is Detractor','No: of Responses','Month']
-    """
-    df = df.copy()
-
-    c_created = detect_created_at(df)
-    c_feedback = detect_feedback_col(df)
-    c_rating  = detect_rating_col(df)
-    c_vertical = detect_by_known(df, "vertical")
-    c_courses  = detect_by_known(df, "courses")
-    c_region   = detect_by_known(df, "region")
-    c_status   = detect_by_known(df, "status")
-    c_prom     = detect_by_known(df, "is_promoter")
-    c_det      = detect_by_known(df, "is_detractor")
-    c_nresp    = detect_by_known(df, "num_responses")
-
-    # Filter to rows that look like raw responses (i.e., must have Vertical/Courses/Region)
-    mask = pd.Series(True, index=df.index)
-    for needed in [c_vertical, c_courses, c_region]:
-        if needed:
-            mask &= df[needed].notna()
-
-    sdf = df.loc[mask, [c for c in [c_created, c_feedback, c_rating, c_vertical, c_courses, c_region, c_status, c_prom, c_det, c_nresp] if c is not None]].copy()
-
-    rename_map = {}
-    if c_created: rename_map[c_created] = "Created At"
-    if c_feedback: rename_map[c_feedback] = "Feedback"
-    if c_rating: rename_map[c_rating] = "Rating"
-    if c_vertical: rename_map[c_vertical] = "Vertical"
-    if c_courses: rename_map[c_courses] = "Courses"
-    if c_region: rename_map[c_region] = "Region"
-    if c_status: rename_map[c_status] = "Status"
-    if c_prom: rename_map[c_prom] = "Is promoter"
-    if c_det: rename_map[c_det] = "Is Detractor"
-    if c_nresp: rename_map[c_nresp] = "No: of Responses"
-
-    sdf.rename(columns=rename_map, inplace=True)
-
-    # Ensure all expected columns exist
-    for col in ["Created At","Feedback","Rating","Vertical","Courses","Region","Status","Is promoter","Is Detractor","No: of Responses"]:
-        if col not in sdf.columns:
-            sdf[col] = np.nan
+# -----------------------------
+# Cache helpers
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def load_and_standardize(file, mapping: dict, month_label: str) -> pd.DataFrame:
+    usecols = [mapping[k] for k in mapping]  # exact source cols
+    df = pd.read_csv(file, usecols=usecols)
+    df = df.rename(columns={v: k for k, v in mapping.items()})
+    # Keep only rows that look like raw responses
+    df = df[df["Vertical"].notna() & df["Courses"].notna() & df["Region"].notna()].copy()
 
     # Types
-    sdf["Rating"] = pd.to_numeric(sdf["Rating"], errors="coerce")
-    sdf["Is promoter"] = pd.to_numeric(sdf["Is promoter"], errors="coerce").fillna(0).astype(int)
-    sdf["Is Detractor"] = pd.to_numeric(sdf["Is Detractor"], errors="coerce").fillna(0).astype(int)
-    sdf["No: of Responses"] = pd.to_numeric(sdf["No: of Responses"], errors="coerce").fillna(1).astype(int)
+    df["Rating"] = pd.to_numeric(df["Rating"], errors="coerce")
+    df["Is promoter"] = pd.to_numeric(df["Is promoter"], errors="coerce").fillna(0).astype("int8")
+    df["Is Detractor"] = pd.to_numeric(df["Is Detractor"], errors="coerce").fillna(0).astype("int8")
+    df["No: of Responses"] = pd.to_numeric(df["No: of Responses"], errors="coerce").fillna(1).astype("int16")
+    df["Created At"] = pd.to_datetime(df["Created At"], errors="coerce")
 
-    # Timestamps
-    with pd.option_context("mode.chained_assignment", None):
-        sdf["Created At"] = pd.to_datetime(sdf["Created At"], errors="coerce")
+    # Downcast text to category to save memory
+    for c in ["Vertical","Courses","Region","Status"]:
+        df[c] = df[c].astype("category")
 
-    sdf["Month"] = month_label
-    return sdf
+    # Ensure all expected columns exist
+    for col in NEEDED:
+        if col not in df.columns:
+            df[col] = np.nan
 
-def nps_calc(group):
-    # NPS = %Promoters (9-10) - %Detractors (0-6)
-    r = group["Rating"]
-    total = r.notna().sum()
-    if total == 0:
-        return np.nan
-    promoters = ((r >= 9) & (r <= 10)).sum()
-    detractors = ((r >= 0) & (r <= 6)).sum()
-    return ((promoters / total) - (detractors / total)) * 100.0
+    df["Month"] = month_label
+    return df[NEEDED + ["Month"]]
 
-def make_download(df, label):
+@st.cache_data(show_spinner=False)
+def build_summaries(combined: pd.DataFrame):
+    # Problems = Detractors
+    problems = combined[combined["Is Detractor"] == 1].copy()
+
+    problems_summary = (
+        problems.groupby(["Region","Courses","Status","Month"], dropna=False)
+        .agg(
+            Detractor_Count=("Is Detractor","sum"),
+            Avg_Detractor_Rating=("Rating","mean"),
+            Example_Comments=("Feedback", lambda x: "; ".join(x.dropna().astype(str).head(3)))
+        )
+        .reset_index()
+        .sort_values(["Region","Courses","Status","Month"])
+    )
+
+    # June vs July comparison
+    pv = (
+        problems_summary
+        .pivot(index=["Region","Courses","Status"], columns="Month", values="Detractor_Count")
+        .fillna(0)
+        .reset_index()
+    )
+    if "June 2025" not in pv.columns: pv["June 2025"] = 0
+    if "July 2025" not in pv.columns: pv["July 2025"] = 0
+    pv["Δ Detractors (Jul - Jun)"] = pv["July 2025"] - pv["June 2025"]
+
+    # NPS calc
+    def nps_calc(g):
+        r = g["Rating"]
+        total = r.notna().sum()
+        if total == 0: return np.nan
+        prom = ((r >= 9) & (r <= 10)).sum()
+        det = ((r >= 0) & (r <= 6)).sum()
+        return ((prom/total) - (det/total)) * 100.0
+
+    nps_table = (
+        combined.groupby(["Region","Courses","Status","Month"], dropna=False)
+        .apply(nps_calc)
+        .reset_index(name="NPS")
+        .sort_values(["Region","Courses","Status","Month"])
+    )
+
+    return problems_summary, pv, nps_table
+
+def download_csv(df, label):
     buf = io.StringIO()
     df.to_csv(buf, index=False)
     st.download_button(
-        label=f"⬇️ Download {label} (CSV)",
-        data=buf.getvalue(),
+        f"⬇️ Download {label}",
+        buf.getvalue(),
         file_name=f"{label.replace(' ','_').lower()}.csv",
         mime="text/csv",
         use_container_width=True
     )
 
 # -----------------------------
-# File inputs
+# Inputs
 # -----------------------------
 c1, c2 = st.columns(2)
 with c1:
@@ -193,26 +136,22 @@ with c1:
 with c2:
     july_file = st.file_uploader("Upload **July** CSV", type=["csv"])
 
+perf_lite = st.toggle("⚡ Lite mode (render fewer rows & only draw charts on click)", value=True)
+
 if not june_file or not july_file:
-    st.info("Upload both **June** and **July** CSVs to begin.")
+    st.info("Upload both files to continue.")
     st.stop()
 
-raw_june = pd.read_csv(june_file)
-raw_july = pd.read_csv(july_file)
-
-june = standardize_month(raw_june, "June 2025")
-july = standardize_month(raw_july, "July 2025")
+june = load_and_standardize(june_file, JUNE_COLS, "June 2025")
+july = load_and_standardize(july_file, JULY_COLS, "July 2025")
 combined = pd.concat([june, july], ignore_index=True)
 
-# -----------------------------
 # Filters
-# -----------------------------
 st.subheader("Filters")
 fc1, fc2, fc3 = st.columns(3)
-
-regions = ["All"] + sorted([x for x in combined["Region"].dropna().astype(str).unique()])
-courses = ["All"] + sorted([x for x in combined["Courses"].dropna().astype(str).unique()])
-statuses = ["All"] + sorted([x for x in combined["Status"].dropna().astype(str).unique()])
+regions = ["All"] + sorted(combined["Region"].dropna().astype(str).unique())
+courses = ["All"] + sorted(combined["Courses"].dropna().astype(str).unique())
+statuses = ["All"] + sorted(combined["Status"].dropna().astype(str).unique())
 
 with fc1:
     f_region = st.selectbox("Region", regions)
@@ -221,118 +160,76 @@ with fc2:
 with fc3:
     f_status = st.selectbox("Batch / Status", statuses)
 
-f = combined.copy()
+f = combined
 if f_region != "All": f = f[f["Region"].astype(str) == f_region]
 if f_course != "All": f = f[f["Courses"].astype(str) == f_course]
 if f_status != "All": f = f[f["Status"].astype(str) == f_status]
 
-# -----------------------------
-# Problem list (Detractors)
-# -----------------------------
-st.header("Regional-wise Monthly NPS Problems")
-problems = f[f["Is Detractor"] == 1].copy()
+problems_summary, compare_table, nps_table = build_summaries(f)
 
-problems_summary = (
-    problems.groupby(["Region","Courses","Status","Month"], dropna=False)
-    .agg(
-        Detractor_Count=("Is Detractor","sum"),
-        Avg_Detractor_Rating=("Rating","mean"),
-        Example_Comments=("Feedback", lambda x: "; ".join(x.dropna().astype(str).head(3)))
-    )
-    .reset_index()
-    .sort_values(["Region","Courses","Status","Month"])
-)
+# Problem listing
+st.header("Regional-wise Monthly NPS Problems (Detractors)")
+st.dataframe(problems_summary.head(100) if perf_lite else problems_summary, use_container_width=True)
+download_csv(problems_summary, "regional_monthly_nps_problems")
 
-st.dataframe(problems_summary, use_container_width=True)
-make_download(problems_summary, "regional_monthly_nps_problems")
-
-# -----------------------------
 # June vs July comparison
-# -----------------------------
-st.header("June vs July – Comparison (per Region/Course/Batch)")
+st.header("June vs July – Detractor Comparison")
+st.dataframe(compare_table.head(100) if perf_lite else compare_table, use_container_width=True)
+download_csv(compare_table, "june_vs_july_detractor_comparison")
 
-pivot = (
-    problems_summary
-    .pivot(index=["Region","Courses","Status"], columns="Month", values="Detractor_Count")
-    .fillna(0)
-    .reset_index()
-)
-if "June 2025" not in pivot.columns: pivot["June 2025"] = 0
-if "July 2025" not in pivot.columns: pivot["July 2025"] = 0
-
-pivot["Δ Detractors (Jul - Jun)"] = pivot["July 2025"] - pivot["June 2025"]
-
-st.dataframe(pivot.sort_values("Δ Detractors (Jul - Jun)", ascending=False), use_container_width=True)
-make_download(pivot, "june_vs_july_detractor_comparison")
-
-# -----------------------------
-# NPS by month (not just detractors)
-# -----------------------------
+# NPS by month
 st.header("NPS by Month (Region/Course/Batch)")
+st.dataframe(nps_table.head(100) if perf_lite else nps_table, use_container_width=True)
+download_csv(nps_table, "nps_by_month_region_course_batch")
 
-nps_table = (
-    f.groupby(["Region","Courses","Status","Month"], dropna=False)
-     .apply(nps_calc)
-     .reset_index(name="NPS")
-     .sort_values(["Region","Courses","Status","Month"])
-)
-st.dataframe(nps_table, use_container_width=True)
-make_download(nps_table, "nps_by_month_region_course_batch")
-
-# -----------------------------
-# Simple charts
-# -----------------------------
+# Charts (on demand)
 st.header("Charts")
-
-# Top problem courses (July) by detractor count
-st.subheader("Top Problem Courses (July 2025) – Detractor Count")
-topj = (
-    problems_summary[problems_summary["Month"] == "July 2025"]
-    .sort_values("Detractor_Count", ascending=False)
-    .head(10)
-)
-if topj.empty:
-    st.info("No detractors in July for the current filter.")
-else:
-    plt.figure()
-    labels = (topj["Region"] + " | " + topj["Courses"]).str.slice(0,70)
-    y = topj["Detractor_Count"].values
-    plt.barh(labels, y)
-    plt.xlabel("Detractor Count")
-    plt.ylabel("Region | Course")
-    plt.gca().invert_yaxis()
-    st.pyplot(plt.gcf(), use_container_width=True)
-
-# Trend bar for a selected triple
-st.subheader("June vs July Trend for Selected Group")
-g1, g2, g3 = st.columns(3)
-with g1:
-    t_region = st.selectbox("Trend Region", regions, key="t_region")
-with g2:
-    t_course = st.selectbox("Trend Course", courses, key="t_course")
-with g3:
-    t_status = st.selectbox("Trend Status", statuses, key="t_status")
-
-tf = problems_summary.copy()
-if t_region != "All": tf = tf[tf["Region"].astype(str) == t_region]
-if t_course != "All": tf = tf[tf["Courses"].astype(str) == t_course]
-if t_status != "All": tf = tf[tf["Status"].astype(str) == t_status]
-
-if tf.empty:
-    st.info("No detractor data for the selected group.")
-else:
-    tf = tf.pivot(index=["Region","Courses","Status"], columns="Month", values="Detractor_Count").fillna(0)
-    if not tf.empty:
-        row = tf.iloc[0]
-        months = row.index.tolist()
-        vals = row.values.tolist()
+if not perf_lite or st.button("Draw charts now"):
+    # Top July Problem Courses
+    topj = (
+        problems_summary[problems_summary["Month"] == "July 2025"]
+        .sort_values("Detractor_Count", ascending=False)
+        .head(10)
+    )
+    if topj.empty:
+        st.info("No July detractors for the current filter.")
+    else:
         plt.figure()
-        plt.bar(months, vals)
-        plt.ylabel("Detractor Count")
+        labels = (topj["Region"] + " | " + topj["Courses"]).astype(str).str.slice(0,70)
+        plt.barh(labels, topj["Detractor_Count"].values)
+        plt.xlabel("Detractor Count")
+        plt.ylabel("Region | Course")
+        plt.gca().invert_yaxis()
         st.pyplot(plt.gcf(), use_container_width=True)
 
-# -----------------------------
-# Raw (standardized) data peek
-# -----------------------------
-with st.expander("Show standardized raw rows (debug)"):
-    st.dataframe(f.sort_values("Created At"), use_container_width=True)
+    # Trend for a selected triple
+    st.subheader("Trend (June vs July) for a Selected Group")
+    g1, g2, g3 = st.columns(3)
+    with g1:
+        t_region = st.selectbox("Trend Region", regions, key="t_r")
+    with g2:
+        t_course = st.selectbox("Trend Course", courses, key="t_c")
+    with g3:
+        t_status = st.selectbox("Trend Status", statuses, key="t_s")
+
+    tf = problems_summary.copy()
+    if t_region != "All": tf = tf[tf["Region"].astype(str) == t_region]
+    if t_course != "All": tf = tf[tf["Courses"].astype(str) == t_course]
+    if t_status != "All": tf = tf[tf["Status"].astype(str) == t_status]
+
+    if not tf.empty:
+        row = (
+            tf.pivot(index=["Region","Courses","Status"], columns="Month", values="Detractor_Count")
+              .fillna(0)
+              .reset_index()
+        )
+        if not row.empty:
+            vals = row.iloc[0][["June 2025","July 2025"]].to_list() if all(m in row.columns for m in ["June 2025","July 2025"]) else [0,0]
+            plt.figure()
+            plt.bar(["June 2025","July 2025"], vals)
+            plt.ylabel("Detractor Count")
+            st.pyplot(plt.gcf(), use_container_width=True)
+    else:
+        st.info("No detractor data for the selected group.")
+else:
+    st.info("Charts skipped in ⚡ Lite mode. Click the button above to draw them.")
